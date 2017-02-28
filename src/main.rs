@@ -35,6 +35,7 @@ use byteorder::{BigEndian, WriteBytesExt};
 use rand::Rng;
 use rand::os::OsRng;
 
+use openssl::error::ErrorStack;
 use openssl::x509::X509;
 use openssl::rsa::PKCS1_PADDING;
 use openssl::hash::{MessageDigest,Hasher};
@@ -63,6 +64,31 @@ struct TlsContext<'a> {
     key_block: Option<KeyBlock<'a>>,
 }
 
+#[derive(Debug)]
+pub enum MyError {
+    OpenSSLError(ErrorStack),
+    IoError(std::io::Error),
+    GenError(GenError),
+}
+
+impl std::convert::From<openssl::error::ErrorStack> for MyError {
+    fn from(e: ErrorStack) -> MyError {
+        MyError::OpenSSLError(e)
+    }
+}
+
+impl std::convert::From<std::io::Error> for MyError {
+    fn from(e: std::io::Error) -> MyError {
+        MyError::IoError(e)
+    }
+}
+
+impl std::convert::From<GenError> for MyError {
+    fn from(e: GenError) -> MyError {
+        MyError::GenError(e)
+    }
+}
+
 #[inline]
 fn debug_hexdump(label: &str, data: &[u8]) {
     debug!("{}",label);
@@ -72,18 +98,18 @@ fn debug_hexdump(label: &str, data: &[u8]) {
 }
 
 #[inline]
-fn hmac_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8]) -> Vec<u8> {
-    let mut signer = Signer::new(*hashalg, key).unwrap();
-    signer.update(a).unwrap();
-    signer.finish().unwrap()
+fn hmac_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8]) -> Result<Vec<u8>,ErrorStack> {
+    let mut signer = try!(Signer::new(*hashalg, key));
+    try!(signer.update(a));
+    signer.finish()
 }
 
 #[inline]
-fn concat_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8], b: &[u8]) -> Vec<u8> {
-    let mut signer = Signer::new(*hashalg, key).unwrap();
-    signer.update(a).unwrap();
-    signer.update(b).unwrap();
-    signer.finish().unwrap()
+fn concat_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8], b: &[u8]) -> Result<Vec<u8>,ErrorStack> {
+    let mut signer = try!(Signer::new(*hashalg, key));
+    try!(signer.update(a));
+    try!(signer.update(b));
+    signer.finish()
 }
 
 #[inline]
@@ -94,37 +120,39 @@ fn concat(a: &[u8], b: &[u8]) -> Vec<u8> {
     ret
 }
 
-fn p_hash(out: &mut [u8], hashalg: &MessageDigest, secret: &[u8], seed: &[u8]) {
+fn p_hash(out: &mut [u8], hashalg: &MessageDigest, secret: &[u8], seed: &[u8]) -> Result<(),MyError> {
     // let hmac_key = hmac::SigningKey::new(hashalg, secret);
-    let hmac_key = PKey::hmac(secret).unwrap();
+    let hmac_key = try!(PKey::hmac(secret));
     // let mut signer = Signer::new(*hashalg, &hmac_key);
 
     // A(1)
-    let mut current_a = hmac_sign(&hmac_key, hashalg, seed);
+    let mut current_a = try!(hmac_sign(&hmac_key, hashalg, seed));
 
     let mut offs = 0;
 
     while offs < out.len() {
         // P_hash[i] = HMAC_hash(secret, A(i) + seed)
-        let p_term = concat_sign(&hmac_key, hashalg, current_a.as_ref(), seed);
-        offs += out[offs..].as_mut().write(p_term.as_ref()).unwrap();
+        let p_term = try!(concat_sign(&hmac_key, hashalg, current_a.as_ref(), seed));
+        offs += try!(out[offs..].as_mut().write(p_term.as_ref()));
 
         // A(i+1) = HMAC_hash(secret, A(i))
         //current_a = hmac::sign(&hmac_key, current_a.as_ref());
-        current_a = hmac_sign(&hmac_key, hashalg, current_a.as_ref());
-    }
+        current_a = try!(hmac_sign(&hmac_key, hashalg, current_a.as_ref()));
+    };
+
+    Ok(())
 }
 
 fn prf(out: &mut [u8],
        hashalg: &MessageDigest,
        secret: &[u8],
        label: &[u8],
-       seed: &[u8]) {
+       seed: &[u8]) -> Result<(),MyError> {
     let joined_seed = concat(label, seed);
-    p_hash(out, hashalg, secret, &joined_seed);
+    p_hash(out, hashalg, secret, &joined_seed)
 }
 
-fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) {
+fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) -> Result<(),MyError> {
     let mut buffer : [u8; 256] = [0; 256];
 
     debug_hexdump("client random:", &ctx.client_random);
@@ -134,16 +162,16 @@ fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) {
     let seed = concat(&ctx.client_random,&ctx.server_random);
     let hashalg = MessageDigest::sha256();
 
-    prf(&mut buffer, &hashalg, pms, label, &seed);
+    try!(prf(&mut buffer, &hashalg, pms, label, &seed));
     let master_secret = &buffer[..48];
 
-    // let master_secret = hash(MessageDigest::sha256(),&b[..idx]).unwrap();
     debug_hexdump(&format!("Master secret ({}):",master_secret.len()), &master_secret);
 
     ctx.master_secret.extend_from_slice(&master_secret);
+    Ok(())
 }
 
-fn compute_keys<'a>(ctx: &'a mut TlsContext) {
+fn compute_keys<'a>(ctx: &'a mut TlsContext) -> Result<(),MyError> {
     let mac_key_length = 32; // XXX SHA256
     let enc_key_length = 16; // XXX AES128
     let fixed_iv_length = 16;
@@ -154,7 +182,7 @@ fn compute_keys<'a>(ctx: &'a mut TlsContext) {
     let seed = concat(&ctx.server_random,&ctx.client_random); // note order: server + client
     let hashalg = MessageDigest::sha256();
 
-    prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed);
+    try!(prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed));
 
     let _key_block = &buffer[..sz];
     debug_hexdump("key block", &_key_block);
@@ -175,6 +203,7 @@ fn compute_keys<'a>(ctx: &'a mut TlsContext) {
     //     } )
     // ).unwrap();
     // ctx.key_block = Some(kb);
+    Ok(())
 }
 
 fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
@@ -230,14 +259,14 @@ fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq
     // protected
 }
 
-fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Vec<u8> {
+fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     let mut buffer : [u8; 256] = [0; 256];
 
     let label = b"client finished";
     let seed = hash;
     let hashalg = MessageDigest::sha256();
 
-    prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed);
+    try!(prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed));
 
     let mut buffer_out : [u8; 256] = [0; 256];
     let res = do_gen!(
@@ -271,11 +300,11 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Vec<u8> {
 
     debug_hexdump("IV + protected:", &reply);
 
-    reply
+    Ok(reply)
 }
 
-fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
-    let mut rng = OsRng::new().unwrap();
+fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) -> Result<(),MyError> {
+    let mut rng = try!(OsRng::new());
     let mut rand : [u8; 48] = [0; 48];
 
     // concat protocol version (2 bytes) + 46 of random
@@ -284,19 +313,19 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
     rng.fill_bytes(&mut rand[2..]);
 
     // compute master secret
-    compute_master_secret(ctx, &rand);
+    try!(compute_master_secret(ctx, &rand));
 
     // derive keys
-    compute_keys(ctx);
+    try!(compute_keys(ctx));
 
     // hexdump(&rand);
 
     // then encrypt to server public key
-    let x509 = X509::from_der(&ctx.server_cert).unwrap();
-    let pkey = x509.public_key().unwrap();
-    let rsa = pkey.rsa().unwrap();
+    let x509 = try!(X509::from_der(&ctx.server_cert));
+    let pkey = try!(x509.public_key());
+    let rsa = try!(pkey.rsa());
     let mut encrypted : [u8; 512] = [0; 512];
-    let sz = rsa.public_encrypt(&rand,&mut encrypted, PKCS1_PADDING).unwrap();
+    let sz = try!(rsa.public_encrypt(&rand,&mut encrypted, PKCS1_PADDING));
     debug_hexdump(&format!("sz: {}",sz), &encrypted[..sz]);
 
     // put it into the CKE
@@ -338,11 +367,11 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
             // XXX 5.. because we hash only the *message*
             // XXX substract 6, to remove the CCS from the hash
             debug!("Extending hash len={}",&b[5..idx-6].len());
-            h.update(&b[5..idx-6]).unwrap();
-            let res_hash = h.finish().unwrap();
+            try!(h.update(&b[5..idx-6]));
+            let res_hash = try!(h.finish());
             debug_hexdump("res_hash: ", &res_hash);
 
-            let e_h = encrypt_hash(ctx, &res_hash);
+            let e_h = try!(encrypt_hash(ctx, &res_hash));
             debug_hexdump("e_h: ", &e_h);
 
             let r = do_gen!(
@@ -351,16 +380,19 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
                 gen_be_u16!(e_h.len()) >>
                 gen_slice!(&e_h)
             );
-            let (b,idx) = r.unwrap();
+            let (b,idx) = try!(r);
 
             let _ = stream.write(&b[..idx]);
         },
         Err(e)    => println!("Error: {:?}",e),
     };
+
+    Ok(())
 }
 
 
-fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream: &mut TcpStream) {
+fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream: &mut TcpStream)
+        -> Result<(),MyError> {
     match msg {
         &TlsMessage::Handshake(ref msg) => {
             debug!("msg: {:?}",msg);
@@ -368,7 +400,7 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
                 &TlsMessageHandshake::ServerHello(ref content) => {
                     ctx.cipher = content.cipher;
                     ctx.compression = content.compression;
-                    ctx.server_random.write_u32::<BigEndian>(content.rand_time).unwrap();
+                    try!(ctx.server_random.write_u32::<BigEndian>(content.rand_time));
                     ctx.server_random.extend_from_slice(content.rand_data);
                 },
                 &TlsMessageHandshake::Certificate(ref content) => {
@@ -376,22 +408,23 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
                 },
                 &TlsMessageHandshake::ServerDone(ref _content) => {
                     // XXX prepare ClienKeyExchange + ChangeCipherSpec + Finished
-                    prepare_key(stream, ctx, h);
+                    try!(prepare_key(stream, ctx, h));
                 },
                 _ => (),
             }
         },
         _ => debug!("msg: {:?}",msg),
-    }
+    };
+    Ok(())
 }
 
-fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, h: &mut Hasher, stream: &mut TcpStream) {
+fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, h: &mut Hasher, stream: &mut TcpStream) -> Result<(),MyError> {
     debug!("record: {:?}", r);
     match r.hdr.record_type {
         0x16 => {
             // XXX exclude HelloRequest messages
             debug!("Extending hash len={}",r.data.len());
-            h.update(r.data).unwrap();
+            try!(h.update(r.data));
         },
         _ => (),
     };
@@ -400,7 +433,7 @@ fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, h: &mut Hasher, stream:
     match res {
         IResult::Done(rem2,ref msg_list) => {
             for msg in msg_list {
-                handle_message(ctx, msg, h, stream);
+                try!(handle_message(ctx, msg, h, stream));
             };
             if rem2.len() > 0 {
                 warn!("extra bytes in TLS record: {:?}",rem2);
@@ -410,7 +443,8 @@ fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, h: &mut Hasher, stream:
             warn!("Defragmentation required (TLS record)");
         },
         IResult::Error(e) => { warn!("parse_tls_record_with_header failed: {:?}",e); },
-    }
+    };
+    Ok(())
 }
 
 
@@ -497,7 +531,7 @@ fn main() {
                 IResult::Done(rem, ref r) => {
                     // debug!("rem: {:?}",rem);
                     cur_i = rem;
-                    handle_record(&mut ctx, r, &mut h, &mut stream);
+                    handle_record(&mut ctx, r, &mut h, &mut stream).unwrap();
                     // status |= self.parse_record_level(r);
                 },
                 IResult::Incomplete(_) => {
