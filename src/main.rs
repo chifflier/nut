@@ -101,6 +101,14 @@ fn debug_hexdump(label: &str, data: &[u8]) {
     }
 }
 
+fn get_cipher_obj(c: &TlsCipherSuite) -> Result<Cipher,MyError> {
+    match (&c.enc,&c.enc_mode,c.enc_size) {
+        (&TlsCipherEnc::Aes,&TlsCipherEncMode::Cbc,128) => Ok(Cipher::aes_128_cbc()),
+        (&TlsCipherEnc::Aes,&TlsCipherEncMode::Cbc,256) => Ok(Cipher::aes_256_cbc()),
+        _ => Err(MyError::UnsupportedCipher),
+    }
+}
+
 #[inline]
 fn hmac_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8]) -> Result<Vec<u8>,ErrorStack> {
     let mut signer = try!(Signer::new(*hashalg, key));
@@ -176,9 +184,12 @@ fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) -> Result<(),MyError>
 }
 
 fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
-    let mac_key_length = 32; // XXX SHA256
-    let enc_key_length = 16; // XXX AES128
-    let fixed_iv_length = 16;
+    let cipher = &ctx.ciphersuite.unwrap();
+    let ossl_cipher = try!(get_cipher_obj(ctx.ciphersuite.unwrap()));
+
+    let mac_key_length = (cipher.mac_size / 8) as usize;
+    let enc_key_length = (cipher.enc_size / 8) as usize;
+    let fixed_iv_length = ossl_cipher.block_size(); // XXX IV length can be different !
     let sz = 2*mac_key_length + 2*enc_key_length + 2*fixed_iv_length;
     let mut buffer : [u8; 256] = [0; 256];
 
@@ -193,26 +204,23 @@ fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
 
     ctx._key_block.extend_from_slice(_key_block);
     let mut ofs = 0;
-    let mac_size = 32;
-    let enc_size = 16;
-    let iv_length = 16;
-    ctx.key_block.client_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_size] );
-    ofs += mac_size;
-    ctx.key_block.server_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_size] );
-    ofs += mac_size;
-    ctx.key_block.client_enc_key.extend_from_slice( &_key_block[ofs .. ofs + enc_size] );
-    ofs += enc_size;
-    ctx.key_block.server_enc_key.extend_from_slice( &_key_block[ofs .. ofs + enc_size] );
-    ofs += enc_size;
+    ctx.key_block.client_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_key_length] );
+    ofs += mac_key_length;
+    ctx.key_block.server_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_key_length] );
+    ofs += mac_key_length;
+    ctx.key_block.client_enc_key.extend_from_slice( &_key_block[ofs .. ofs + enc_key_length] );
+    ofs += enc_key_length;
+    ctx.key_block.server_enc_key.extend_from_slice( &_key_block[ofs .. ofs + enc_key_length] );
+    ofs += enc_key_length;
     // XXX read IV if ciphersuite is using IV
-    ctx.key_block.client_write_iv.extend_from_slice( &_key_block[ofs .. ofs + iv_length] );
-    ofs += iv_length;
-    ctx.key_block.server_write_iv.extend_from_slice( &_key_block[ofs .. ofs + iv_length] );
-    // ofs += iv_length;
+    ctx.key_block.client_write_iv.extend_from_slice( &_key_block[ofs .. ofs + fixed_iv_length] );
+    ofs += fixed_iv_length;
+    ctx.key_block.server_write_iv.extend_from_slice( &_key_block[ofs .. ofs + fixed_iv_length] );
+    // ofs += fixed_iv_length;
     Ok(())
 }
 
-fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
+fn protect_data(cipher: &Cipher, plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
         -> Result<Vec<u8>,MyError> {
     let hashalg = MessageDigest::sha256();
     let hmac_key = try!(PKey::hmac(key_mac));
@@ -241,17 +249,18 @@ fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq
     v.extend_from_slice(plaintext);
     v.extend_from_slice(&hmac_computed);
     // add padding manually (see later)
-    let mut padding_length = 16 - (v.len() % 16);
-    if padding_length == 0 { padding_length = 16; };
+    let pad_to = cipher.block_size();
+    let mut padding_length = pad_to - (v.len() % pad_to);
+    if padding_length == 0 { padding_length = pad_to; };
     for _i in 0 .. padding_length {
         v.push((padding_length-1) as u8);
     };
 
     debug_hexdump("plaintext + hmac + padding:", &v);
 
+    debug!("boo");
     // aes_128_cbc adds padding by default, but using the wrong type
-    let cipher = Cipher::aes_128_cbc();
-    let mut crypter = try!(Crypter::new(cipher,Mode::Encrypt,key_aes,Some(iv)));
+    let mut crypter = try!(Crypter::new(*cipher,Mode::Encrypt,key_aes,Some(iv)));
     crypter.pad(false);
 
     let mut out = vec![0; v.len() + cipher.block_size()];
@@ -292,8 +301,10 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     debug_hexdump("key_mac:", key_mac);
     debug_hexdump("key_aes:", key_aes);
 
+    let cipher = try!(get_cipher_obj(ctx.ciphersuite.unwrap()));
+
     // 0x16: message type (handshake)
-    let p = try!(protect_data(content, session_iv, key_aes, key_mac, 0, 0x16));
+    let p = try!(protect_data(&cipher, content, session_iv, key_aes, key_mac, 0, 0x16));
 
     // protected
     let mut reply = Vec::new();
@@ -489,6 +500,7 @@ fn main() {
     let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
 
     let ciphers = vec![
+        0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
         0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
     ];
     let comp = vec![0x00];
@@ -723,5 +735,19 @@ fn test_prf_512() {
         0x40, 0xd4, 0xd8, 0x98,
     ];
     assert_eq!(&expected[..],&buffer[..expected.len()]);
+}
+
+#[test]
+fn test_aes_256_cbc() {
+    let cipher = openssl::symm::Cipher::aes_256_cbc();
+    println!("key size: {}", cipher.key_len());
+    println!("iv len: {:?}", cipher.iv_len());
+    println!("block size: {}", cipher.block_size());
+
+    let key = vec![0; 32];
+    let iv = vec![1; 16];
+    let block = vec![2; 16];
+
+    let _ = openssl::symm::encrypt(cipher, &key, Some(&iv), &block).unwrap();
 }
 } // cfg(test_
