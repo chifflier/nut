@@ -55,7 +55,7 @@ struct KeyBlock {
 struct TlsContext {
     client_random: Vec<u8>,
     server_random: Vec<u8>,
-    ciphersuite: Option<&'static TlsCipherSuite>,
+    ciphersuite: &'static TlsCipherSuite,
     compression: u8,
     server_cert: Vec<u8>,
     master_secret: Vec<u8>,
@@ -68,7 +68,7 @@ impl TlsContext {
         TlsContext{
             client_random: Vec::with_capacity(32),
             server_random: Vec::with_capacity(32),
-            ciphersuite: None,
+            ciphersuite: TlsCipherSuite::from_id(0).unwrap(),
             compression: 0,
             server_cert: Vec::new(),
             master_secret: Vec::new(),
@@ -203,8 +203,8 @@ fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) -> Result<(),MyError>
 }
 
 fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
-    let cipher = &ctx.ciphersuite.unwrap();
-    let ossl_cipher = try!(get_cipher_obj(ctx.ciphersuite.unwrap()));
+    let cipher = ctx.ciphersuite;
+    let ossl_cipher = try!(get_cipher_obj(cipher));
 
     let mac_key_length = (cipher.mac_size / 8) as usize;
     let enc_key_length = (cipher.enc_size / 8) as usize;
@@ -319,7 +319,7 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     debug_hexdump("key_mac:", key_mac);
     debug_hexdump("key_aes:", key_aes);
 
-    let cipher = try!(get_cipher_obj(ctx.ciphersuite.unwrap()));
+    let cipher = try!(get_cipher_obj(ctx.ciphersuite));
 
     // 0x16: message type (handshake)
     let p = try!(protect_data(&cipher, content, session_iv, key_aes, key_mac, 0, 0x16));
@@ -431,10 +431,11 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
             match msg {
                 &TlsMessageHandshake::ServerHello(ref content) => {
                     ctx.compression = content.compression;
-                    ctx.ciphersuite = TlsCipherSuite::from_id(content.cipher);
-                    debug!("cipher: {:?}",ctx.ciphersuite);
-                    if ctx.ciphersuite.is_none() {return Err(MyError::UnsupportedCipher);};
+                    let cipher = TlsCipherSuite::from_id(content.cipher);
+                    debug!("cipher: {:?}",cipher);
+                    if cipher.is_none() {return Err(MyError::UnsupportedCipher);};
                     if ctx.compression > 0 {return Err(MyError::UnsupportedCompression);};
+                    ctx.ciphersuite = cipher.unwrap();
                     try!(ctx.server_random.write_u32::<BigEndian>(content.rand_time));
                     ctx.server_random.extend_from_slice(content.rand_data);
                 },
