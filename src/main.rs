@@ -38,10 +38,13 @@ use rand::os::OsRng;
 use openssl::error::ErrorStack;
 use openssl::x509::X509;
 use openssl::rsa::PKCS1_PADDING;
-use openssl::hash::{MessageDigest,Hasher};
+use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::sign::Signer;
 use openssl::symm::{Cipher,Crypter,Mode};
+
+mod tls_handshakehash;
+use tls_handshakehash::*;
 
 struct KeyBlock {
     client_mac_key: Vec<u8>,
@@ -61,6 +64,8 @@ struct TlsContext {
     master_secret: Vec<u8>,
 
     key_block: KeyBlock,
+
+    hh: HandshakeHash,
 }
 
 impl TlsContext {
@@ -80,6 +85,7 @@ impl TlsContext {
                 client_write_iv: Vec::new(),
                 server_write_iv: Vec::new(),
             },
+            hh: HandshakeHash::new(),
         }
     }
 }
@@ -92,6 +98,7 @@ pub enum MyError {
 
     UnsupportedCipher,
     UnsupportedCompression,
+    UnsupportedMac,
 }
 
 impl std::convert::From<openssl::error::ErrorStack> for MyError {
@@ -125,6 +132,14 @@ fn get_cipher_obj(c: &TlsCipherSuite) -> Result<Cipher,MyError> {
         (&TlsCipherEnc::Aes,&TlsCipherEncMode::Cbc,128) => Ok(Cipher::aes_128_cbc()),
         (&TlsCipherEnc::Aes,&TlsCipherEncMode::Cbc,256) => Ok(Cipher::aes_256_cbc()),
         _ => Err(MyError::UnsupportedCipher),
+    }
+}
+
+fn get_mac_obj(c: &TlsCipherSuite) -> Result<MessageDigest,MyError> {
+    match &c.mac {
+        &TlsCipherMac::HmacSha1   => Ok(MessageDigest::sha1()),
+        &TlsCipherMac::HmacSha256 => Ok(MessageDigest::sha256()),
+        _ => Err(MyError::UnsupportedMac),
     }
 }
 
@@ -191,6 +206,8 @@ fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) -> Result<(),MyError>
 
     let label = b"master secret";
     let seed = concat(&ctx.client_random,&ctx.server_random);
+    // let hashalg = try!(get_mac_obj(ctx.ciphersuite));
+    // XXX SHA-256 is used when TLS >= 1.2 is negociated
     let hashalg = MessageDigest::sha256();
 
     try!(prf(&mut buffer, &hashalg, pms, label, &seed));
@@ -214,6 +231,8 @@ fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
 
     let label = b"key expansion";
     let seed = concat(&ctx.server_random,&ctx.client_random); // note order: server + client
+    // let hashalg = try!(get_mac_obj(ctx.ciphersuite));
+    // XXX SHA-256 is used when TLS >= 1.2 is negociated
     let hashalg = MessageDigest::sha256();
 
     try!(prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed));
@@ -238,11 +257,10 @@ fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
     Ok(())
 }
 
-fn protect_data(cipher: &Cipher, plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
+fn protect_data(cipher: &Cipher, mac: MessageDigest, plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
         -> Result<Vec<u8>,MyError> {
-    let hashalg = MessageDigest::sha256();
     let hmac_key = try!(PKey::hmac(key_mac));
-    let mut signer = try!(Signer::new(hashalg, &hmac_key));
+    let mut signer = try!(Signer::new(mac, &hmac_key));
 
     let mut buffer : [u8; 256] = [0; 256];
     let res = do_gen!(
@@ -276,7 +294,6 @@ fn protect_data(cipher: &Cipher, plaintext: &[u8], iv: &[u8], key_aes: &[u8], ke
 
     debug_hexdump("plaintext + hmac + padding:", &v);
 
-    debug!("boo");
     // aes_128_cbc adds padding by default, but using the wrong type
     let mut crypter = try!(Crypter::new(*cipher,Mode::Encrypt,key_aes,Some(iv)));
     crypter.pad(false);
@@ -295,9 +312,12 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
 
     let label = b"client finished";
     let seed = hash;
-    let hashalg = MessageDigest::sha256();
+    let hashalg = try!(get_mac_obj(ctx.ciphersuite));
+    // XXX SHA-256 is used when TLS >= 1.2 is negociated
+    // let hashalg = MessageDigest::sha256();
+    let prf_alg = MessageDigest::sha256();
 
-    try!(prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed));
+    try!(prf(&mut buffer, &prf_alg, &ctx.master_secret, label, &seed));
 
     let mut buffer_out : [u8; 256] = [0; 256];
     let res = do_gen!(
@@ -322,7 +342,7 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     let cipher = try!(get_cipher_obj(ctx.ciphersuite));
 
     // 0x16: message type (handshake)
-    let p = try!(protect_data(&cipher, content, session_iv, key_aes, key_mac, 0, 0x16));
+    let p = try!(protect_data(&cipher, hashalg, content, session_iv, key_aes, key_mac, 0, 0x16));
 
     // protected
     let mut reply = Vec::new();
@@ -335,7 +355,7 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     Ok(reply)
 }
 
-fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) -> Result<(),MyError> {
+fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext) -> Result<(),MyError> {
     let mut rng = try!(OsRng::new());
     let mut rand : [u8; 48] = [0; 48];
 
@@ -399,8 +419,8 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) -> 
             // XXX 5.. because we hash only the *message*
             // XXX substract 6, to remove the CCS from the hash
             debug!("Extending hash len={}",&b[5..idx-6].len());
-            try!(h.update(&b[5..idx-6]));
-            let res_hash = try!(h.finish());
+            try!(ctx.hh.extend(&b[5..idx-6]));
+            let res_hash = try!(ctx.hh.finish());
             debug_hexdump("res_hash: ", &res_hash);
 
             let e_h = try!(encrypt_hash(ctx, &res_hash));
@@ -423,7 +443,7 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) -> 
 }
 
 
-fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream: &mut TcpStream)
+fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, stream: &mut TcpStream)
         -> Result<(),MyError> {
     match msg {
         &TlsMessage::Handshake(ref msg) => {
@@ -436,6 +456,10 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
                     if cipher.is_none() {return Err(MyError::UnsupportedCipher);};
                     if ctx.compression > 0 {return Err(MyError::UnsupportedCompression);};
                     ctx.ciphersuite = cipher.unwrap();
+                    // let hmac = try!(get_mac_obj(ctx.ciphersuite));
+                    // XXX SHA-256 is used when TLS >= 1.2 is negociated
+                    let hmac = MessageDigest::sha256();
+                    ctx.hh.set_hash(hmac).unwrap();
                     try!(ctx.server_random.write_u32::<BigEndian>(content.rand_time));
                     ctx.server_random.extend_from_slice(content.rand_data);
                 },
@@ -444,7 +468,7 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
                 },
                 &TlsMessageHandshake::ServerDone(ref _content) => {
                     // XXX prepare ClienKeyExchange + ChangeCipherSpec + Finished
-                    try!(prepare_key(stream, ctx, h));
+                    try!(prepare_key(stream, ctx));
                 },
                 _ => {
                     warn!("Unsupported message: {:?}",msg);
@@ -456,13 +480,13 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
     Ok(())
 }
 
-fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, h: &mut Hasher, stream: &mut TcpStream) -> Result<(),MyError> {
+fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, stream: &mut TcpStream) -> Result<(),MyError> {
     debug!("record: {:?}", r);
     match r.hdr.record_type {
         0x16 => {
             // XXX exclude HelloRequest messages
             debug!("Extending hash len={}",r.data.len());
-            try!(h.update(r.data));
+            try!(ctx.hh.extend(r.data));
         },
         _ => (),
     };
@@ -471,7 +495,7 @@ fn handle_record(ctx: &mut TlsContext, r: &TlsRawRecord, h: &mut Hasher, stream:
     match res {
         IResult::Done(rem2,ref msg_list) => {
             for msg in msg_list {
-                try!(handle_message(ctx, msg, h, stream));
+                try!(handle_message(ctx, msg, stream));
             };
             if rem2.len() > 0 {
                 warn!("extra bytes in TLS record: {:?}",rem2);
@@ -498,32 +522,33 @@ fn main() {
     rng.fill_bytes(&mut rand_data);
 
     let mut ctx = TlsContext::new();
-    let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
 
     let ciphers = vec![
         0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
         0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
+        0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
+        0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
     ];
     let comp = vec![0x00];
 
-    let ch = TlsPlaintext {
+    let ch = TlsMessageHandshake::ClientHello(
+        TlsClientHelloContents {
+            version: 0x0303,
+            rand_time: rand_time,
+            rand_data: &rand_data,
+            session_id: None,
+            ciphers: ciphers,
+            comp: comp,
+            ext: None,
+        });
+
+    let rec_ch = TlsPlaintext {
         hdr: TlsRecordHeader {
             record_type: TlsRecordType::Handshake as u8,
             version: 0x0301,
             len: 0,
         },
-        msg: vec![TlsMessage::Handshake(
-            TlsMessageHandshake::ClientHello(
-                    TlsClientHelloContents {
-                        version: 0x0303,
-                        rand_time: rand_time,
-                        rand_data: &rand_data,
-                        session_id: None,
-                        ciphers: ciphers,
-                        comp: comp,
-                        ext: None,
-                    })
-        )]
+        msg: vec![TlsMessage::Handshake(ch)],
     };
 
     ctx.client_random.write_u32::<BigEndian>(rand_time).unwrap();
@@ -535,13 +560,13 @@ fn main() {
         let mut mem : [u8; 218] = [0; 218];
         let s = &mut mem[..];
 
-        let res = gen_tls_plaintext((s,0), &ch);
+        let res = gen_tls_plaintext((s,0), &rec_ch);
         match res {
             Ok((b,idx)) => {
                 debug!("Sending client hello ({})",idx);
                 // XXX 5.. because we hash only the *message*
                 debug!("Extending hash len={}",&b[5..idx].len());
-                h.update(&b[5..idx]).unwrap();
+                ctx.hh.extend(&b[5..idx]).unwrap();
                 let _ = stream.write(&b[..idx]);
             },
             Err(e)    => println!("Error: {:?}",e),
@@ -561,7 +586,7 @@ fn main() {
                 IResult::Done(rem, ref r) => {
                     // debug!("rem: {:?}",rem);
                     cur_i = rem;
-                    handle_record(&mut ctx, r, &mut h, &mut stream).unwrap();
+                    handle_record(&mut ctx, r, &mut stream).unwrap();
                     // status |= self.parse_record_level(r);
                 },
                 IResult::Incomplete(_) => {
