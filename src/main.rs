@@ -12,7 +12,7 @@ extern crate rand;
 extern crate openssl;
 
 extern crate hexdump;
-use hexdump::hexdump;
+use hexdump::hexdump_iter;
 
 #[macro_use]
 extern crate nom;
@@ -63,14 +63,22 @@ struct TlsContext<'a> {
     key_block: Option<KeyBlock<'a>>,
 }
 
+#[inline]
+fn debug_hexdump(label: &str, data: &[u8]) {
+    debug!("{}",label);
+    for line in hexdump_iter(data) {
+        debug!("{}",line);
+    }
+}
 
-
+#[inline]
 fn hmac_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8]) -> Vec<u8> {
     let mut signer = Signer::new(*hashalg, key).unwrap();
     signer.update(a).unwrap();
     signer.finish().unwrap()
 }
 
+#[inline]
 fn concat_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut signer = Signer::new(*hashalg, key).unwrap();
     signer.update(a).unwrap();
@@ -78,6 +86,7 @@ fn concat_sign(key: &PKey, hashalg: &MessageDigest, a: &[u8], b: &[u8]) -> Vec<u
     signer.finish().unwrap()
 }
 
+#[inline]
 fn concat(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut ret = Vec::new();
     ret.extend_from_slice(a);
@@ -118,10 +127,8 @@ fn prf(out: &mut [u8],
 fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) {
     let mut buffer : [u8; 256] = [0; 256];
 
-    debug!("client random:");
-    hexdump(&ctx.client_random);
-    debug!("server random:");
-    hexdump(&ctx.server_random);
+    debug_hexdump("client random:", &ctx.client_random);
+    debug_hexdump("server random:", &ctx.server_random);
 
     let label = b"master secret";
     let seed = concat(&ctx.client_random,&ctx.server_random);
@@ -131,8 +138,7 @@ fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) {
     let master_secret = &buffer[..48];
 
     // let master_secret = hash(MessageDigest::sha256(),&b[..idx]).unwrap();
-    debug!("MASTER SECRET ({})",master_secret.len());
-    hexdump(&master_secret);
+    debug_hexdump(&format!("Master secret ({}):",master_secret.len()), &master_secret);
 
     ctx.master_secret.extend_from_slice(&master_secret);
 }
@@ -151,8 +157,7 @@ fn compute_keys<'a>(ctx: &'a mut TlsContext) {
     prf(&mut buffer, &hashalg, &ctx.master_secret, label, &seed);
 
     let _key_block = &buffer[..sz];
-    debug!("key block");
-    hexdump(&_key_block);
+    debug_hexdump("key block", &_key_block);
 
     ctx._key_block.extend_from_slice(_key_block);
     // let kb : &'a[u8] = &ctx._key_block;
@@ -189,14 +194,12 @@ fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq
     );
     let (b,idx) = res.unwrap();
 
-    debug!("plaintext to MAC");
-    hexdump(&b[..idx]);
+    debug_hexdump("plaintext to MAC", &b[..idx]);
 
     signer.update(&b[..idx]).unwrap();
     let hmac_computed = signer.finish().unwrap();
 
-    debug!("Message MAC");
-    hexdump(&hmac_computed);
+    debug_hexdump("Message MAC", &hmac_computed);
 
     // XXX append: plaintext + hmac_computed + padding
     let mut v = Vec::new();
@@ -209,8 +212,7 @@ fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq
         v.push((padding_length-1) as u8);
     };
 
-    debug!("plaintext + hmac + padding:");
-    hexdump(&v);
+    debug_hexdump("plaintext + hmac + padding:", &v);
 
     let cipher = Cipher::aes_128_cbc();
     let mut crypter = Crypter::new(cipher,Mode::Encrypt,key_aes,Some(iv)).unwrap();
@@ -247,18 +249,15 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Vec<u8> {
     let (b,idx) = res.unwrap();
     let content = &b[..idx];
 
-    debug!("Finished message:");
-    hexdump(content);
-    // XXX now protect record
+    debug_hexdump("Finished message:", content);
 
+    // now protect record
     let key_mac = &ctx._key_block[0..32];
     let key_aes = &ctx._key_block[64..80];
     let session_iv = &ctx._key_block[96..112];
 
-    debug!("key_mac:");
-    hexdump(key_mac);
-    debug!("key_aes:");
-    hexdump(key_aes);
+    debug_hexdump("key_mac:", key_mac);
+    debug_hexdump("key_aes:", key_aes);
 
     // // XXX 32: size of hash (sha256)
     let p = protect_data(content, session_iv, key_aes, key_mac, 0, 0x16);
@@ -270,8 +269,7 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Vec<u8> {
     reply.extend_from_slice(session_iv);
     reply.extend_from_slice(&p);
 
-    debug!("IV + protected:");
-    hexdump(&reply);
+    debug_hexdump("IV + protected:", &reply);
 
     reply
 }
@@ -299,8 +297,7 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
     let rsa = pkey.rsa().unwrap();
     let mut encrypted : [u8; 512] = [0; 512];
     let sz = rsa.public_encrypt(&rand,&mut encrypted, PKCS1_PADDING).unwrap();
-    debug!("sz: {}",sz);
-    hexdump(&encrypted[..sz]);
+    debug_hexdump(&format!("sz: {}",sz), &encrypted[..sz]);
 
     // put it into the CKE
     let cke = TlsMessageHandshake::ClientKeyExchange(
@@ -328,10 +325,9 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
     };
 
     let mut mem : [u8; 1024] = [0; 1024];
-    let s = &mut mem[..];
 
     let res = do_gen!(
-        (s,0),
+        (&mut mem,0),
         gen_tls_plaintext(&record_cke) >>
         gen_tls_plaintext(&record_ccs)
     );
@@ -344,12 +340,10 @@ fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext, h: &mut Hasher) {
             debug!("Extending hash len={}",&b[5..idx-6].len());
             h.update(&b[5..idx-6]).unwrap();
             let res_hash = h.finish().unwrap();
-            debug!("res_hash: ");
-            hexdump(&res_hash);
+            debug_hexdump("res_hash: ", &res_hash);
 
             let e_h = encrypt_hash(ctx, &res_hash);
-            debug!("e_h: ");
-            hexdump(&e_h);
+            debug_hexdump("e_h: ", &e_h);
 
             let r = do_gen!(
                 (b,idx),
