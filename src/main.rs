@@ -56,13 +56,32 @@ struct TlsContext {
     client_random: Vec<u8>,
     server_random: Vec<u8>,
     ciphersuite: Option<&'static TlsCipherSuite>,
-    cipher: u16,
     compression: u8,
     server_cert: Vec<u8>,
     master_secret: Vec<u8>,
 
-    _key_block: Vec<u8>,
     key_block: KeyBlock,
+}
+
+impl TlsContext {
+    pub fn new() -> TlsContext {
+        TlsContext{
+            client_random: Vec::with_capacity(32),
+            server_random: Vec::with_capacity(32),
+            ciphersuite: None,
+            compression: 0,
+            server_cert: Vec::new(),
+            master_secret: Vec::new(),
+            key_block: KeyBlock{
+                client_mac_key: Vec::new(),
+                server_mac_key: Vec::new(),
+                client_enc_key: Vec::new(),
+                server_enc_key: Vec::new(),
+                client_write_iv: Vec::new(),
+                server_write_iv: Vec::new(),
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -202,7 +221,6 @@ fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
     let _key_block = &buffer[..sz];
     debug_hexdump("key block", &_key_block);
 
-    ctx._key_block.extend_from_slice(_key_block);
     let mut ofs = 0;
     ctx.key_block.client_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_key_length] );
     ofs += mac_key_length;
@@ -412,7 +430,6 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
             debug!("msg: {:?}",msg);
             match msg {
                 &TlsMessageHandshake::ServerHello(ref content) => {
-                    ctx.cipher = content.cipher;
                     ctx.compression = content.compression;
                     ctx.ciphersuite = TlsCipherSuite::from_id(content.cipher);
                     debug!("cipher: {:?}",ctx.ciphersuite);
@@ -479,24 +496,7 @@ fn main() {
     let mut rand_data : [u8; 28] = [0; 28];
     rng.fill_bytes(&mut rand_data);
 
-    let mut ctx = TlsContext{
-        client_random: Vec::with_capacity(32),
-        server_random: Vec::with_capacity(32),
-        ciphersuite: None,
-        cipher: 0,
-        compression: 0,
-        server_cert: Vec::new(),
-        master_secret: Vec::new(),
-        _key_block: Vec::new(),
-        key_block: KeyBlock{
-            client_mac_key: Vec::new(),
-            server_mac_key: Vec::new(),
-            client_enc_key: Vec::new(),
-            server_enc_key: Vec::new(),
-            client_write_iv: Vec::new(),
-            server_write_iv: Vec::new(),
-        },
-    };
+    let mut ctx = TlsContext::new();
     let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
 
     let ciphers = vec![
