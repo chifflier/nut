@@ -14,8 +14,8 @@ rand = "*"
 openssl = "*"
 byteorder = "*"
 rusticata-macros = "*"
-#tls-parser = { git = "https://github.com/rusticata/tls-parser.git" }
+tls-parser = { git = "https://github.com/rusticata/tls-parser.git", branch="serialize", features = ["serialize"] }
 
-[dependencies.tls-parser]
-path = "/home/pollux/CODE/RUST/tls-parser"
-features = ["serialize"]
+# [dependencies.tls-parser]
+# path = "../tls-parser"
+# features = ["serialize"]
