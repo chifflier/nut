@@ -1,0 +1,21 @@
+[package]
+name = "nut"
+version = "0.1.0"
+description = "Network user tool"
+license = "LGPL-2.1+"
+authors = ["Pierre Chifflier <chifflier@wzdftpd.net>"]
+
+[dependencies]
+log = "0.3.6"
+env_logger = "*"
+nom = "^2"
+hexdump = "*"
+rand = "*"
+openssl = "*"
+byteorder = "*"
+rusticata-macros = "*"
+#tls-parser = { git = "https://github.com/rusticata/tls-parser.git" }
+
+[dependencies.tls-parser]
+path = "/home/pollux/CODE/RUST/tls-parser"
+features = ["serialize"]
