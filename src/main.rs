@@ -43,25 +43,26 @@ use openssl::pkey::PKey;
 use openssl::sign::Signer;
 use openssl::symm::{Cipher,Crypter,Mode};
 
-#[derive(Debug)]
-struct KeyBlock<'a> {
-    client_mac_key: &'a[u8],
-    server_mac_key: &'a[u8],
-    client_enc_key: &'a[u8],
-    server_enc_key: &'a[u8],
+struct KeyBlock {
+    client_mac_key: Vec<u8>,
+    server_mac_key: Vec<u8>,
+    client_enc_key: Vec<u8>,
+    server_enc_key: Vec<u8>,
+    client_write_iv: Vec<u8>,
+    server_write_iv: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct TlsContext<'a> {
+struct TlsContext {
     client_random: Vec<u8>,
     server_random: Vec<u8>,
+    ciphersuite: Option<&'static TlsCipherSuite>,
     cipher: u16,
     compression: u8,
     server_cert: Vec<u8>,
     master_secret: Vec<u8>,
 
     _key_block: Vec<u8>,
-    key_block: Option<KeyBlock<'a>>,
+    key_block: KeyBlock,
 }
 
 #[derive(Debug)]
@@ -69,6 +70,9 @@ pub enum MyError {
     OpenSSLError(ErrorStack),
     IoError(std::io::Error),
     GenError(GenError),
+
+    UnsupportedCipher,
+    UnsupportedCompression,
 }
 
 impl std::convert::From<openssl::error::ErrorStack> for MyError {
@@ -171,7 +175,7 @@ fn compute_master_secret(ctx: &mut TlsContext, pms: &[u8]) -> Result<(),MyError>
     Ok(())
 }
 
-fn compute_keys<'a>(ctx: &'a mut TlsContext) -> Result<(),MyError> {
+fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
     let mac_key_length = 32; // XXX SHA256
     let enc_key_length = 16; // XXX AES128
     let fixed_iv_length = 16;
@@ -188,29 +192,31 @@ fn compute_keys<'a>(ctx: &'a mut TlsContext) -> Result<(),MyError> {
     debug_hexdump("key block", &_key_block);
 
     ctx._key_block.extend_from_slice(_key_block);
-    // let kb : &'a[u8] = &ctx._key_block;
-    // let (_,kb) = do_parse!(
-    //     kb,
-    //     c_m: take!(16) >>
-    //     s_m: take!(16) >>
-    //     c_k: take!(16) >>
-    //     s_k: take!(16) >>
-    //     ( KeyBlock{
-    //         client_mac_key: c_m,
-    //         server_mac_key: s_m,
-    //         client_enc_key: c_k,
-    //         server_enc_key: s_k,
-    //     } )
-    // ).unwrap();
-    // ctx.key_block = Some(kb);
+    let mut ofs = 0;
+    let mac_size = 32;
+    let enc_size = 16;
+    let iv_length = 16;
+    ctx.key_block.client_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_size] );
+    ofs += mac_size;
+    ctx.key_block.server_mac_key.extend_from_slice( &_key_block[ofs .. ofs + mac_size] );
+    ofs += mac_size;
+    ctx.key_block.client_enc_key.extend_from_slice( &_key_block[ofs .. ofs + enc_size] );
+    ofs += enc_size;
+    ctx.key_block.server_enc_key.extend_from_slice( &_key_block[ofs .. ofs + enc_size] );
+    ofs += enc_size;
+    // XXX read IV if ciphersuite is using IV
+    ctx.key_block.client_write_iv.extend_from_slice( &_key_block[ofs .. ofs + iv_length] );
+    ofs += iv_length;
+    ctx.key_block.server_write_iv.extend_from_slice( &_key_block[ofs .. ofs + iv_length] );
+    // ofs += iv_length;
     Ok(())
 }
 
 fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
-        -> Vec<u8> {
+        -> Result<Vec<u8>,MyError> {
     let hashalg = MessageDigest::sha256();
-    let hmac_key = PKey::hmac(key_mac).unwrap();
-    let mut signer = Signer::new(hashalg, &hmac_key).unwrap();
+    let hmac_key = try!(PKey::hmac(key_mac));
+    let mut signer = try!(Signer::new(hashalg, &hmac_key));
 
     let mut buffer : [u8; 256] = [0; 256];
     let res = do_gen!(
@@ -221,20 +227,20 @@ fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq
         gen_be_u16!(plaintext.len()) >>
         gen_slice!(plaintext)
     );
-    let (b,idx) = res.unwrap();
+    let (b,idx) = try!(res);
 
     debug_hexdump("plaintext to MAC", &b[..idx]);
 
-    signer.update(&b[..idx]).unwrap();
-    let hmac_computed = signer.finish().unwrap();
+    try!(signer.update(&b[..idx]));
+    let hmac_computed = try!(signer.finish());
 
     debug_hexdump("Message MAC", &hmac_computed);
 
-    // XXX append: plaintext + hmac_computed + padding
+    // append: plaintext + hmac_computed + padding
     let mut v = Vec::new();
     v.extend_from_slice(plaintext);
     v.extend_from_slice(&hmac_computed);
-    // XXX apparently, aes_128_cbc already adds padding
+    // add padding manually (see later)
     let mut padding_length = 16 - (v.len() % 16);
     if padding_length == 0 { padding_length = 16; };
     for _i in 0 .. padding_length {
@@ -243,20 +249,18 @@ fn protect_data(plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq
 
     debug_hexdump("plaintext + hmac + padding:", &v);
 
+    // aes_128_cbc adds padding by default, but using the wrong type
     let cipher = Cipher::aes_128_cbc();
-    let mut crypter = Crypter::new(cipher,Mode::Encrypt,key_aes,Some(iv)).unwrap();
+    let mut crypter = try!(Crypter::new(cipher,Mode::Encrypt,key_aes,Some(iv)));
     crypter.pad(false);
 
     let mut out = vec![0; v.len() + cipher.block_size()];
 
-    let count = crypter.update(&v, &mut out).unwrap();
-    let sz = crypter.finalize(&mut out[count..]).unwrap();
+    let count = try!(crypter.update(&v, &mut out));
+    let sz = try!(crypter.finalize(&mut out[count..]));
     out.truncate(count+sz);
 
-    out
-
-    // let protected = encrypt(Cipher::aes_128_cbc(),key_aes,Some(iv),&v).unwrap();
-    // protected
+    Ok(out)
 }
 
 fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
@@ -275,22 +279,21 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
         gen_be_u24!(12) >>
         gen_copy!(buffer,12)
     );
-    let (b,idx) = res.unwrap();
+    let (b,idx) = try!(res);
     let content = &b[..idx];
 
     debug_hexdump("Finished message:", content);
 
     // now protect record
-    let key_mac = &ctx._key_block[0..32];
-    let key_aes = &ctx._key_block[64..80];
-    let session_iv = &ctx._key_block[96..112];
+    let key_mac = &ctx.key_block.client_mac_key;
+    let key_aes = &ctx.key_block.client_enc_key;
+    let session_iv = &ctx.key_block.client_write_iv;
 
     debug_hexdump("key_mac:", key_mac);
     debug_hexdump("key_aes:", key_aes);
 
-    // // XXX 32: size of hash (sha256)
-    let p = protect_data(content, session_iv, key_aes, key_mac, 0, 0x16);
-    // let protected = encrypt(Cipher::aes_128_cbc(),key_aes,Some(iv),&buffer[..32]).unwrap();
+    // 0x16: message type (handshake)
+    let p = try!(protect_data(content, session_iv, key_aes, key_mac, 0, 0x16));
 
     // protected
     let mut reply = Vec::new();
@@ -400,6 +403,10 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
                 &TlsMessageHandshake::ServerHello(ref content) => {
                     ctx.cipher = content.cipher;
                     ctx.compression = content.compression;
+                    ctx.ciphersuite = TlsCipherSuite::from_id(content.cipher);
+                    debug!("cipher: {:?}",ctx.ciphersuite);
+                    if ctx.ciphersuite.is_none() {return Err(MyError::UnsupportedCipher);};
+                    if ctx.compression > 0 {return Err(MyError::UnsupportedCompression);};
                     try!(ctx.server_random.write_u32::<BigEndian>(content.rand_time));
                     ctx.server_random.extend_from_slice(content.rand_data);
                 },
@@ -410,7 +417,9 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, h: &mut Hasher, stream
                     // XXX prepare ClienKeyExchange + ChangeCipherSpec + Finished
                     try!(prepare_key(stream, ctx, h));
                 },
-                _ => (),
+                _ => {
+                    warn!("Unsupported message: {:?}",msg);
+                },
             }
         },
         _ => debug!("msg: {:?}",msg),
@@ -462,12 +471,20 @@ fn main() {
     let mut ctx = TlsContext{
         client_random: Vec::with_capacity(32),
         server_random: Vec::with_capacity(32),
+        ciphersuite: None,
         cipher: 0,
         compression: 0,
         server_cert: Vec::new(),
         master_secret: Vec::new(),
         _key_block: Vec::new(),
-        key_block: None,
+        key_block: KeyBlock{
+            client_mac_key: Vec::new(),
+            server_mac_key: Vec::new(),
+            client_enc_key: Vec::new(),
+            server_enc_key: Vec::new(),
+            client_write_iv: Vec::new(),
+            server_write_iv: Vec::new(),
+        },
     };
     let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
 
