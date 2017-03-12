@@ -619,7 +619,7 @@ fn test_prf_224() {
     let label = b"test label";
     let hashalg = MessageDigest::sha224();
 
-    prf(&mut buffer, &hashalg, secret, label, seed);
+    prf(&mut buffer, &hashalg, secret, label, seed).unwrap();
 
     let expected = &[
         0x22, 0x4d, 0x8a, 0xf3, 0xc0, 0x45, 0x33, 0x93,
@@ -653,7 +653,7 @@ fn test_prf_256() {
     let label = b"test label";
     let hashalg = MessageDigest::sha256();
 
-    prf(&mut buffer, &hashalg, secret, label, seed);
+    prf(&mut buffer, &hashalg, secret, label, seed).unwrap();
 
     let expected = &[
         0xe3, 0xf2, 0x29, 0xba, 0x72, 0x7b, 0xe1, 0x7b,
@@ -689,7 +689,7 @@ fn test_prf_384() {
     let label = b"test label";
     let hashalg = MessageDigest::sha384();
 
-    prf(&mut buffer, &hashalg, secret, label, seed);
+    prf(&mut buffer, &hashalg, secret, label, seed).unwrap();
 
     let expected = &[
         0x7b, 0x0c, 0x18, 0xe9, 0xce, 0xd4, 0x10, 0xed,
@@ -731,7 +731,7 @@ fn test_prf_512() {
     let label = b"test label";
     let hashalg = MessageDigest::sha512();
 
-    prf(&mut buffer, &hashalg, secret, label, seed);
+    prf(&mut buffer, &hashalg, secret, label, seed).unwrap();
 
     let expected = &[
         0x12, 0x61, 0xf5, 0x88, 0xc7, 0x98, 0xc5, 0xc2,
