@@ -14,7 +14,6 @@ extern crate openssl;
 extern crate hexdump;
 use hexdump::hexdump_iter;
 
-#[macro_use]
 extern crate nom;
 extern crate tls_parser;
 
@@ -41,7 +40,7 @@ use openssl::rsa::PKCS1_PADDING;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::sign::Signer;
-use openssl::symm::{Cipher,Crypter,Mode};
+use openssl::symm::{Cipher,Crypter,Mode,encrypt_aead};
 
 mod tls_handshakehash;
 use tls_handshakehash::*;
@@ -66,6 +65,7 @@ struct TlsContext {
     key_block: KeyBlock,
 
     hh: HandshakeHash,
+    rng: OsRng,
 }
 
 impl TlsContext {
@@ -86,6 +86,7 @@ impl TlsContext {
                 server_write_iv: Vec::new(),
             },
             hh: HandshakeHash::new(),
+            rng: OsRng::new().unwrap(),
         }
     }
 }
@@ -131,6 +132,8 @@ fn get_cipher_obj(c: &TlsCipherSuite) -> Result<Cipher,MyError> {
     match (&c.enc,&c.enc_mode,c.enc_size) {
         (&TlsCipherEnc::Aes,&TlsCipherEncMode::Cbc,128) => Ok(Cipher::aes_128_cbc()),
         (&TlsCipherEnc::Aes,&TlsCipherEncMode::Cbc,256) => Ok(Cipher::aes_256_cbc()),
+        (&TlsCipherEnc::Aes,&TlsCipherEncMode::Gcm,128) => Ok(Cipher::aes_128_gcm()),
+        (&TlsCipherEnc::Aes,&TlsCipherEncMode::Gcm,256) => Ok(Cipher::aes_256_gcm()),
         _ => Err(MyError::UnsupportedCipher),
     }
 }
@@ -139,7 +142,10 @@ fn get_mac_obj(c: &TlsCipherSuite) -> Result<MessageDigest,MyError> {
     match &c.mac {
         &TlsCipherMac::HmacSha1   => Ok(MessageDigest::sha1()),
         &TlsCipherMac::HmacSha256 => Ok(MessageDigest::sha256()),
-        _ => Err(MyError::UnsupportedMac),
+        _ => {
+            warn!("Unsupported Mac {:?}",&c.mac);
+            Err(MyError::UnsupportedMac)
+        },
     }
 }
 
@@ -223,9 +229,17 @@ fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
     let cipher = ctx.ciphersuite;
     let ossl_cipher = try!(get_cipher_obj(cipher));
 
-    let mac_key_length = (cipher.mac_size / 8) as usize;
+    let mac_key_length = match cipher.enc_mode {
+        TlsCipherEncMode::Ccm => 0,
+        TlsCipherEncMode::Gcm => 0,
+        _                     => (cipher.mac_size / 8) as usize,
+    };
     let enc_key_length = (cipher.enc_size / 8) as usize;
-    let fixed_iv_length = ossl_cipher.block_size(); // XXX IV length can be different !
+    let fixed_iv_length = match cipher.enc_mode {
+        TlsCipherEncMode::Ccm => 4,
+        TlsCipherEncMode::Gcm => 4,
+        _                     => ossl_cipher.block_size(), // XXX IV length can be different !
+    };
     let sz = 2*mac_key_length + 2*enc_key_length + 2*fixed_iv_length;
     let mut buffer : [u8; 256] = [0; 256];
 
@@ -257,10 +271,42 @@ fn compute_keys(ctx: &mut TlsContext) -> Result<(),MyError> {
     Ok(())
 }
 
+fn protect_data_aead(cipher: &Cipher, plaintext: &[u8], iv: &[u8], key_aes: &[u8], seq_num: u64, content_type: u8)
+        -> Result<Vec<u8>,MyError> {
+
+    debug_hexdump("key:", key_aes);
+    debug_hexdump("iv:", iv);
+
+    // build additional data
+    let mut buffer : [u8; 256] = [0; 256];
+    let res = do_gen!(
+        (&mut buffer,0),
+        gen_be_u32!(0) >> gen_be_u32!(seq_num as u32) >> // XXX gen_be_u64!(seq_num)
+        gen_be_u8!(content_type) >>
+        gen_be_u16!(0x0303) >>
+        gen_be_u16!(plaintext.len())
+    );
+    let (b,idx) = try!(res);
+
+    let aad = &b[..idx];
+    debug_hexdump("Additional data", aad);
+
+    let mut tag = vec![0; 16];
+
+    let mut out = try!(encrypt_aead(*cipher, key_aes, Some(iv), aad, plaintext, &mut tag));
+    debug_hexdump("Tag", &tag);
+    out.append(&mut tag);
+
+    Ok(out)
+}
+
 fn protect_data(cipher: &Cipher, mac: MessageDigest, plaintext: &[u8], iv: &[u8], key_aes: &[u8], key_mac: &[u8], seq_num: u64, content_type: u8)
         -> Result<Vec<u8>,MyError> {
     let hmac_key = try!(PKey::hmac(key_mac));
     let mut signer = try!(Signer::new(mac, &hmac_key));
+
+    debug_hexdump("key_mac:", key_mac);
+    debug_hexdump("key_aes:", key_aes);
 
     let mut buffer : [u8; 256] = [0; 256];
     let res = do_gen!(
@@ -312,7 +358,6 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
 
     let label = b"client finished";
     let seed = hash;
-    let hashalg = try!(get_mac_obj(ctx.ciphersuite));
     // XXX SHA-256 is used when TLS >= 1.2 is negociated
     // let hashalg = MessageDigest::sha256();
     let prf_alg = MessageDigest::sha256();
@@ -334,20 +379,31 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     // now protect record
     let key_mac = &ctx.key_block.client_mac_key;
     let key_aes = &ctx.key_block.client_enc_key;
-    let session_iv = &ctx.key_block.client_write_iv;
-
-    debug_hexdump("key_mac:", key_mac);
-    debug_hexdump("key_aes:", key_aes);
+    let mut explicit_iv = ctx.key_block.client_write_iv.clone();
 
     let cipher = try!(get_cipher_obj(ctx.ciphersuite));
-
     // 0x16: message type (handshake)
-    let p = try!(protect_data(&cipher, hashalg, content, session_iv, key_aes, key_mac, 0, 0x16));
+    let msg_type = 0x16;
+
+    let p = match ctx.ciphersuite.mac {
+        TlsCipherMac::Aead => {
+            explicit_iv = vec![0;8];
+            ctx.rng.fill_bytes(&mut explicit_iv);
+            let mut nonce = ctx.key_block.client_write_iv.clone();
+            nonce.extend_from_slice(&explicit_iv);
+            try!(protect_data_aead(&cipher, content, &nonce, key_aes, 0, msg_type))
+        },
+        _ => {
+            let hashalg = try!(get_mac_obj(ctx.ciphersuite));
+            // 0x16: message type (handshake)
+            try!(protect_data(&cipher, hashalg, content, &explicit_iv, key_aes, key_mac, 0, msg_type))
+        },
+    };
 
     // protected
     let mut reply = Vec::new();
     // reply.extend_from_slice(iv);
-    reply.extend_from_slice(session_iv);
+    reply.extend_from_slice(&explicit_iv);
     reply.extend_from_slice(&p);
 
     debug_hexdump("IV + protected:", &reply);
@@ -356,13 +412,12 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
 }
 
 fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext) -> Result<(),MyError> {
-    let mut rng = try!(OsRng::new());
     let mut rand : [u8; 48] = [0; 48];
 
     // concat protocol version (2 bytes) + 46 of random
     rand[0] = 0x03;
     rand[1] = 0x03;
-    rng.fill_bytes(&mut rand[2..]);
+    ctx.rng.fill_bytes(&mut rand[2..]);
 
     // compute master secret
     try!(compute_master_secret(ctx, &rand));
@@ -516,14 +571,14 @@ fn main() {
     let _ = env_logger::init().unwrap();
     openssl::init();
 
-    let mut rng = OsRng::new().unwrap();
-    let rand_time = rng.next_u32();
-    let mut rand_data : [u8; 28] = [0; 28];
-    rng.fill_bytes(&mut rand_data);
-
     let mut ctx = TlsContext::new();
 
+    let rand_time = ctx.rng.next_u32();
+    let mut rand_data : [u8; 28] = [0; 28];
+    ctx.rng.fill_bytes(&mut rand_data);
+
     let ciphers = vec![
+        0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256
         0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
         0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
         0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
