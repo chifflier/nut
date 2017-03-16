@@ -14,7 +14,8 @@ extern crate openssl;
 extern crate hexdump;
 use hexdump::hexdump_iter;
 
-extern crate nom;
+#[macro_use] extern crate nom;
+#[macro_use] extern crate der_parser;
 extern crate tls_parser;
 
 #[macro_use]
@@ -37,7 +38,7 @@ use rand::os::OsRng;
 use openssl::error::ErrorStack;
 use openssl::x509::X509;
 use openssl::rsa::PKCS1_PADDING;
-use openssl::hash::MessageDigest;
+use openssl::hash::{hash,MessageDigest};
 use openssl::pkey::PKey;
 use openssl::sign::Signer;
 use openssl::symm::{Cipher,Crypter,Mode,encrypt_aead};
@@ -45,6 +46,8 @@ use openssl::bn::BigNum;
 
 mod tls_handshakehash;
 use tls_handshakehash::*;
+mod digestinfo;
+use digestinfo::*;
 
 struct KeyBlock {
     client_mac_key: Vec<u8>,
@@ -112,6 +115,12 @@ pub enum MyError {
     UnsupportedCipher,
     UnsupportedCompression,
     UnsupportedMac,
+
+    UnsupportedHash,
+    UnsupportedSignature,
+
+    IncorrectHash,
+    IncorrectSignature,
 
     MissingParameters,
 }
@@ -378,14 +387,56 @@ fn extract_dh_params_server(ctx : &mut TlsContext, msg: &TlsServerKeyExchangeCon
     let ires = parse_dh_params(msg.parameters);
     debug!("parse_dh_params:\n{:?}", ires);
     let (rem,dh) = ires.unwrap();
-    debug_hexdump("rem", rem);
-    // let ires = parse_digitally_signed_old(msg.parameters);
-    // debug!("parse_digitally_signed_old:\n{:?}", ires);
-    // XXX check signature !
-    // digitally-signed OLD is organized as following:
+
+    // check signature
+    // digitally-signed OLD is organized as following (RFC 5246 section 4.7):
     // sig-hash algorithm (02 01 for RSA-SHA1)
-    // length (01 00 for 256)
+    // length (01 00 for SHA-256)
     // <signature>
+    let ires = parse_digitally_signed(rem);
+    // debug!("parse_digitally_signed:\n{:?}", ires);
+    let (_,sig) = ires.unwrap();
+
+    {
+        // XXX check signature
+        let raw_dh_params = &msg.parameters[0 .. (msg.parameters.len() - rem.len())];
+        let mut candidate = concat(&ctx.client_random, &ctx.server_random);
+        candidate.extend_from_slice(raw_dh_params);
+        // XXX hash that, using sig.h
+        let alg = sig.alg.unwrap();
+        if alg.sign != SignAlgorithm::Rsa as u8 { return Err(MyError::UnsupportedSignature); };
+        let md = match alg.hash {
+            0x02 /* HashAlgorithm::Sha1 */   => MessageDigest::sha1(),
+            0x03 /* HashAlgorithm::Sha224 */ => MessageDigest::sha224(),
+            0x04 /* HashAlgorithm::Sha256 */ => MessageDigest::sha256(),
+            0x05 /* HashAlgorithm::Sha384 */ => MessageDigest::sha384(),
+            0x06 /* HashAlgorithm::Sha512 */ => MessageDigest::sha512(),
+            _ => { return Err(MyError::UnsupportedHash); },
+        };
+        let real_hash = try!(hash(md, &candidate));
+        // debug_hexdump("real_hash", &real_hash);
+
+        let mut provided_signature = vec![0; 512];
+        let x509 = try!(X509::from_der(&ctx.server_cert));
+        let pkey = try!(x509.public_key());
+        let rsa = try!(pkey.rsa());
+        let sz = try!(rsa.public_decrypt(&sig.data,&mut provided_signature, PKCS1_PADDING));
+        provided_signature.truncate(sz);
+        // debug_hexdump("provided_signature", &provided_signature);
+
+
+        let ires_di = parse_digest_info(&provided_signature);
+        let digest_info = match ires_di {
+            IResult::Done(_,Ok(di)) => di,
+            IResult::Done(_,Err(_)) => { return Err(MyError::IncorrectSignature); },
+            _ => { return Err(MyError::IncorrectSignature); },
+        };
+
+        if real_hash != digest_info.digest {
+            return Err(MyError::IncorrectHash);
+        };
+        debug!("DH:  Params signature and hash verified");
+    }
 
     let p = BigNum::from_slice(dh.dh_p).unwrap();
     debug!("DH: p.num_bits: {}", p.num_bits());

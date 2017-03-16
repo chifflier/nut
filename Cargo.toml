@@ -14,7 +14,11 @@ rand = "*"
 openssl = "*"
 byteorder = "*"
 rusticata-macros = "*"
+der-parser = "*"
 tls-parser = { git = "https://github.com/rusticata/tls-parser.git", branch="serialize", features = ["serialize"] }
+
+# [dependencies.der-parser]
+# path = "../der-parser"
 
 # [dependencies.tls-parser]
 # path = "../tls-parser"
