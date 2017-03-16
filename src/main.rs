@@ -41,6 +41,7 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::sign::Signer;
 use openssl::symm::{Cipher,Crypter,Mode,encrypt_aead};
+use openssl::bn::BigNum;
 
 mod tls_handshakehash;
 use tls_handshakehash::*;
@@ -54,6 +55,13 @@ struct KeyBlock {
     server_write_iv: Vec<u8>,
 }
 
+struct DHParams {
+    g: BigNum,
+    y: BigNum,
+    p: BigNum,
+    z: BigNum,
+}
+
 struct TlsContext {
     client_random: Vec<u8>,
     server_random: Vec<u8>,
@@ -63,6 +71,8 @@ struct TlsContext {
     master_secret: Vec<u8>,
 
     key_block: KeyBlock,
+
+    dh_params: Option<DHParams>,
 
     hh: HandshakeHash,
     rng: OsRng,
@@ -85,6 +95,7 @@ impl TlsContext {
                 client_write_iv: Vec::new(),
                 server_write_iv: Vec::new(),
             },
+            dh_params: None,
             hh: HandshakeHash::new(),
             rng: OsRng::new().unwrap(),
         }
@@ -97,9 +108,12 @@ pub enum MyError {
     IoError(std::io::Error),
     GenError(GenError),
 
+    UnsupportedKx,
     UnsupportedCipher,
     UnsupportedCompression,
     UnsupportedMac,
+
+    MissingParameters,
 }
 
 impl std::convert::From<openssl::error::ErrorStack> for MyError {
@@ -353,6 +367,52 @@ fn protect_data(cipher: &Cipher, mac: MessageDigest, plaintext: &[u8], iv: &[u8]
     Ok(out)
 }
 
+fn extract_dh_params_server(ctx : &mut TlsContext, msg: &TlsServerKeyExchangeContents) -> Result<(),MyError> {
+    match ctx.ciphersuite.kx {
+        TlsCipherKx::Dhe => (),
+        _                => { return Err(MyError::UnsupportedKx); },
+    };
+    // XXX extended is true if we has seen extension SignatureAlgorithms
+    let extended = false; // XXX hardcoded XXX
+    // let res = parse_content_and_signature(msg.parameters, parse_dh_params, extended);
+    let ires = parse_dh_params(msg.parameters);
+    debug!("parse_dh_params:\n{:?}", ires);
+    let (rem,dh) = ires.unwrap();
+    debug_hexdump("rem", rem);
+    // let ires = parse_digitally_signed_old(msg.parameters);
+    // debug!("parse_digitally_signed_old:\n{:?}", ires);
+    // XXX check signature !
+    // digitally-signed OLD is organized as following:
+    // sig-hash algorithm (02 01 for RSA-SHA1)
+    // length (01 00 for 256)
+    // <signature>
+
+    let p = BigNum::from_slice(dh.dh_p).unwrap();
+    debug!("DH: p.num_bits: {}", p.num_bits());
+
+    let g = BigNum::from_slice(dh.dh_g).unwrap();
+    let ys = BigNum::from_slice(dh.dh_ys).unwrap();
+
+    let mut y =  BigNum::new().unwrap();
+    y.rand(g.num_bits(), openssl::bn::MSB_MAYBE_ZERO, false).unwrap();
+
+    let mut bn_ctx = openssl::bn::BigNumContext::new().unwrap();
+    let mut g_y = BigNum::new().unwrap();
+    g_y.mod_exp(&g, &y, &p, &mut bn_ctx).unwrap();
+
+    let mut shared_secret = openssl::bn::BigNum::new().unwrap();
+    shared_secret.mod_exp(&ys, &y, &p, &mut bn_ctx).unwrap();
+
+    ctx.dh_params = Some(DHParams{
+        g: g,
+        y: y,
+        p: p,
+        z: shared_secret,
+    });
+
+    Ok(())
+}
+
 fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
     let mut buffer : [u8; 256] = [0; 256];
 
@@ -412,33 +472,71 @@ fn encrypt_hash(ctx: &mut TlsContext, hash: &[u8]) -> Result<Vec<u8>,MyError> {
 }
 
 fn prepare_key(stream: &mut TcpStream, ctx: &mut TlsContext) -> Result<(),MyError> {
-    let mut rand : [u8; 48] = [0; 48];
-
-    // concat protocol version (2 bytes) + 46 of random
-    rand[0] = 0x03;
-    rand[1] = 0x03;
-    ctx.rng.fill_bytes(&mut rand[2..]);
+    let pms = match ctx.ciphersuite.kx {
+        TlsCipherKx::Rsa => {
+            let mut rand = vec![0; 48];
+            // concat protocol version (2 bytes) + 46 of random
+            rand[0] = 0x03;
+            rand[1] = 0x03;
+            ctx.rng.fill_bytes(&mut rand[2..]);
+            rand
+        },
+        TlsCipherKx::Dhe => {
+            match ctx.dh_params {
+                Some (ref dh) => {
+                    let mut rand = Vec::new();
+                    rand.extend_from_slice(&dh.z.to_vec());
+                    rand
+                },
+                _ => { return Err(MyError::MissingParameters); },
+            }
+        },
+        _ => { return Err(MyError::UnsupportedKx); },
+    };
 
     // compute master secret
-    try!(compute_master_secret(ctx, &rand));
+    try!(compute_master_secret(ctx, &pms));
 
     // derive keys
     try!(compute_keys(ctx));
 
     // hexdump(&rand);
 
-    // then encrypt to server public key
-    let x509 = try!(X509::from_der(&ctx.server_cert));
-    let pkey = try!(x509.public_key());
-    let rsa = try!(pkey.rsa());
-    let mut encrypted : [u8; 512] = [0; 512];
-    let sz = try!(rsa.public_encrypt(&rand,&mut encrypted, PKCS1_PADDING));
-    debug_hexdump(&format!("sz: {}",sz), &encrypted[..sz]);
+    let cke_content = match ctx.ciphersuite.kx {
+        TlsCipherKx::Rsa => {
+            let mut encrypted = vec![0; 512];
+            // then encrypt to server public key
+            let x509 = try!(X509::from_der(&ctx.server_cert));
+            let pkey = try!(x509.public_key());
+            let rsa = try!(pkey.rsa());
+            let sz = try!(rsa.public_encrypt(&pms,&mut encrypted, PKCS1_PADDING));
+            encrypted.truncate(sz);
+            encrypted
+        },
+        TlsCipherKx::Dhe => {
+            match ctx.dh_params {
+                Some (ref dh) => {
+                    let mut v = Vec::new();
+                    let mut bn_ctx = openssl::bn::BigNumContext::new().unwrap();
+                    let mut g_y = BigNum::new().unwrap();
+                    g_y.mod_exp(&dh.g, &dh.y, &dh.p, &mut bn_ctx).unwrap();
+                    v.extend_from_slice(&g_y.to_vec());
+                    v
+                },
+                _ => { return Err(MyError::MissingParameters); },
+            }
+        },
+        _ => { return Err(MyError::UnsupportedKx); },
+    };
+
+
+    let sz = cke_content.len();
+    debug_hexdump(&format!("CKE content: sz:{}",sz), &cke_content);
 
     // put it into the CKE
     let cke = TlsMessageHandshake::ClientKeyExchange(
         TlsClientKeyExchangeContents{
-            parameters: &encrypted[..sz],
+            parameters: &cke_content,
         }
     );
 
@@ -521,6 +619,9 @@ fn handle_message(ctx: &mut TlsContext, msg: &TlsMessage, stream: &mut TcpStream
                 &TlsMessageHandshake::Certificate(ref content) => {
                     ctx.server_cert.extend_from_slice(content.cert_chain[0].data);
                 },
+                &TlsMessageHandshake::ServerKeyExchange(ref content) => {
+                    try!(extract_dh_params_server(ctx,content));
+                },
                 &TlsMessageHandshake::ServerDone(ref _content) => {
                     // XXX prepare ClienKeyExchange + ChangeCipherSpec + Finished
                     try!(prepare_key(stream, ctx));
@@ -578,11 +679,12 @@ fn main() {
     ctx.rng.fill_bytes(&mut rand_data);
 
     let ciphers = vec![
-        0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256
-        0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
-        0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
-        0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
-        0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
+        0x0067,    // TLS_DHE_RSA_WITH_AES_128_CBC_SHA256
+        // 0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256
+        // 0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
+        // 0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
+        // 0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
+        // 0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
     ];
     let comp = vec![0x00];
 
